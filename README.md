@@ -4,7 +4,7 @@
   <a href='https://dancegrpo.github.io/'><img src='https://img.shields.io/badge/Visualization-green?logo=github'></a> &nbsp;
   <a href='https://github.com/XueZeyue/DanceGRPO'><img src="https://img.shields.io/badge/Code-9E95B7?logo=github"></a> &nbsp;
   <a href="https://www.semanticscholar.org/paper/32566efe68955837f5d677cde1cddff09dbad381">
-  <img src="https://img.shields.io/semantic-scholar/c/arXiv:2505.07818?style=flat-square&cacheSeconds=3600" alt="Semantic Scholar Citations">
+    <img src="https://img.shields.io/badge/Semantic_Scholar-100000?logo=semantic-scholar&logoColor=white&labelColor=grey&color=blue&cacheSeconds=3600" alt="Semantic Scholar">
   </a>&nbsp;
 </div>
 
