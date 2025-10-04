@@ -1,5 +1,12 @@
-## DanceGRPO
-**DanceGRPO is the first unified RL-based framework for visual generation.**
+<h1 align="center"> DanceGRPO </h1>
+<div align="center">
+  <a href='https://arxiv.org/abs/2505.07818'><img src='https://img.shields.io/badge/ArXiv-red?logo=arxiv'></a>  &nbsp;
+  <a href='https://dancegrpo.github.io/'><img src='https://img.shields.io/badge/Visualization-green?logo=github'></a> &nbsp;
+  <a href='https://github.com/XueZeyue/DanceGRPO'><img src="https://img.shields.io/badge/Code-9E95B7?logo=github"></a> &nbsp;
+  <a href="https://www.semanticscholar.org/paper/32566efe68955837f5d677cde1cddff09dbad381">
+  <img src="https://img.shields.io/semantic-scholar/c/arXiv:2505.07818?style=flat-square&cacheSeconds=3600" alt="Semantic Scholar Citations">
+  </a>&nbsp;
+</div>
 
 This is the official implementation for [paper](https://arxiv.org/abs/2505.07818), DanceGRPO: Unleashing GRPO on Visual Generation.
 We develop [DanceGRPO](https://arxiv.org/abs/2505.07818) based on FastVideo, a scalable and efficient framework for video and image generation.
@@ -157,8 +164,6 @@ Thanks for the issue from [@Yi-Xuan XU](https://github.com/xuyxu), the results o
 
 We support the EMA for FLUX with `--ema_decay 0.995` and `--use_ema`. Enabling EMA helps with better visualization.
 
-[Pref-GRPO](https://arxiv.org/pdf/2508.20751) also discusses how to avoid reward hacking. [FlowCPS](https://arxiv.org/abs/2509.05952) provides a better SDE for RLHF training.
-
 ## How to Support Custom Models
 1. For preprocessing, modify the `preprocess_flux_embedding.py` and `latent_flux_rl_datasets.py` based on your text encoder.
 2. For FSDP and dataloader, modify the `fsdp_util.py` and `communications_flux.py`, we prefer FSDP rather than DeepSpeed since FSDP is easier to debug.
@@ -174,7 +179,22 @@ How to debug:
 
 ## Training Acceleration
 1. You can reduce the sampling steps, resolution, or timestep selection ratio.
-2. The outstanding follow-up works such as [MixGRPO](https://arxiv.org/abs/2507.21802) and [BranchGRPO](https://arxiv.org/abs/2509.06040) are also working on training acceleration. [SRPO](https://github.com/Tencent-Hunyuan/SRPO) also tries to adopt differentiable reward models to accelerate the training.
+2. Please refer to the community extensions&applications.
+
+## Community Extensions&Applications:
+We want to express our deep gratitude to the community applications and extensions:
+1. [MixGRPO](https://arxiv.org/abs/2507.21802) adopts a mix ode-sde paradigm to accelerate the training. [2025.7]
+2. [Pref-GRPO](https://arxiv.org/pdf/2508.20751) discusses how to avoid reward hacking. [2025.8]
+3. [FlowCPS](https://arxiv.org/abs/2509.05952) provides a better SDE for RLHF training. [2025.9]
+4. [SRPO](https://github.com/Tencent-Hunyuan/SRPO) tries to adopt differentiable reward models to accelerate the training. [2025.9]
+5. [BranchGRPO](https://arxiv.org/abs/2509.06040) utilizes a tree structure to develop a better GRPO training system. [2025.9]
+6. [Dynamic-TreeRPO](https://www.arxiv.org/abs/2509.23352) implements the sliding-window sampling strategy as a tree-structured search method. [2025.9]
+7. [RLIR](https://arxiv.org/abs/2509.23958) extends the GRPO-style paradigm to world model. [2025.9]
+8. [PCPO](https://arxiv.org/abs/2509.25774) enforces proportional credit assignment through a stable objective reformulation and a principled reweighting of timesteps. [2025.9]
+9. [Self-forcing++](https://arxiv.org/abs/2510.02283) extends the GRPO-style paradigm to long videos. [2025.10]
+10. [G2RPO](https://arxiv.org/abs/2510.01982) achieves precise and comprehensive reward assessments of sampling directions in reinforcement learning of flow models. [2025.10]
+
+
 
 
 ## Acknowledgement
