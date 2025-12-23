@@ -23,3 +23,19 @@ torchrun --nproc_per_node=$GPU_NUM --master_port 19003 \
     --output_dir $OUTPUT_DIR \
     --prompt_dir "./assets/empty.txt" \
     --model_type hunyuan_hf
+_______
+
+torchrun --nproc_per_node=4  \
+    fastvideo/data_preprocess/preprocess_hunyuan_embeddings.py \
+    --model_path "data/SkyReels-I2V" \
+    --output_dir "data/rl_embeddings" \
+    --prompt_dir "./assets/consist-id_subset.txt" \
+    --model_type hunyuan_hf
+
+
+torchrun --nproc_per_node=4  \
+    fastvideo/data_preprocess/preprocess_hunyuan_embeddings.py \
+    --model_path "data/SkyReels-I2V" \
+    --output_dir "data/empty" \
+    --prompt_dir "./assets/empty.txt" \
+    --model_type hunyuan_hf

@@ -105,6 +105,7 @@ def get_dit_fsdp_kwargs(
         "device_id": device_id,
         "limit_all_gathers": True,
         "cpu_offload": cpu_offload,
+        "use_orig_params": True,
     }
 
     # Add LoRA-specific settings when LoRA is enabled

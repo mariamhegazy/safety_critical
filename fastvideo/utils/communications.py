@@ -303,15 +303,29 @@ def sp_parallel_dataloader_wrapper(
 ):
     while True:
         for data_item in dataloader:
-            cond, cond_mask, caption = data_item
+            if not isinstance(data_item, (list, tuple)) or len(data_item) < 3:
+                raise ValueError(
+                    "Dataloader items must be tuples of at least (cond, cond_mask, caption)."
+                )
+            cond, cond_mask, caption, *extra_items = data_item
             #latents = latents.to(device)
             cond = cond.to(device)
             #attn_mask = attn_mask.to(device)
             cond_mask = cond_mask.to(device)
+            processed_extra_items = []
+            for extra in extra_items:
+                if torch.is_tensor(extra):
+                    processed_extra_items.append(extra.to(device))
+                elif isinstance(extra, tuple):
+                    processed_extra_items.append(list(extra))
+                elif isinstance(extra, list):
+                    processed_extra_items.append(extra)
+                else:
+                    processed_extra_items.append(extra)
             #frame = latents.shape[2]
             frame = 19
             if frame == 1:
-                yield cond, cond_mask, caption
+                yield (cond, cond_mask, caption, *processed_extra_items)
             else:
                 cond, cond_mask, caption = prepare_sequence_parallel_data(
                     cond, cond_mask, caption
@@ -325,11 +339,19 @@ def sp_parallel_dataloader_wrapper(
                     encoder_hidden_states = cond[st_idx:ed_idx]
                     #attention_mask = attn_mask[st_idx:ed_idx]
                     encoder_attention_mask = cond_mask[st_idx:ed_idx]
+                    batch_extras = []
+                    for extra in processed_extra_items:
+                        if torch.is_tensor(extra):
+                            batch_extras.append(extra[st_idx:ed_idx])
+                        elif isinstance(extra, list):
+                            batch_extras.append(extra[st_idx:ed_idx])
+                        else:
+                            batch_extras.append(extra)
                     yield (
                         #latents[st_idx:ed_idx],
                         encoder_hidden_states,
                         #attention_mask,
                         encoder_attention_mask,
-                        caption
+                        caption,
+                        *batch_extras,
                     )
-

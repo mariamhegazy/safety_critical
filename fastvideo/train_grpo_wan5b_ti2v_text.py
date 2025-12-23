@@ -5,23 +5,26 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
+from diffusers import UniPCMultistepScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.video_processor import VideoProcessor
-from PIL import Image
 from torch.distributed.fsdp import FullStateDictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchvision import transforms
 from tqdm.auto import tqdm
 
 import wandb
-from fastvideo.dataset.latent_rl_datasets import LatentDataset, latent_collate_function
+from fastvideo.dataset.latent_wan_2_2_rl_datasets import (
+    LatentDataset,
+    latent_collate_function,
+)
 from fastvideo.utils.checkpoint import (
     resume_lora_optimizer,
     save_checkpoint,
@@ -40,12 +43,48 @@ from fastvideo.utils.parallel_states import (
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
-import time
 from collections import deque
 
-from diffusers import FluxPipeline
 from diffusers.utils import export_to_video
-from einops import rearrange
+
+WAN5B_SPATIAL_DOWNSAMPLE = 8
+WAN5B_TEMPORAL_DOWNSAMPLE = 4
+WAN5B_CHANNELS = 48
+
+
+def _unwrap_module(module):
+    """
+    Unwrap nested FSDP / DDP containers to access the underlying model.
+    """
+    while hasattr(module, "module"):
+        module = module.module
+    return module
+
+
+def _reshape_vae_latent_stats(vae, latents):
+    latents_mean = vae.config.latents_mean
+    latents_std = vae.config.latents_std
+    if latents_mean is None and hasattr(vae.config, "latents_mean"):
+        latents_mean = vae.config.latents_mean
+    if latents_std is None and hasattr(vae.config, "latents_std"):
+        latents_std = vae.config.latents_std
+    if latents_mean is None or latents_std is None:
+        return None, None
+    latents_mean = torch.as_tensor(
+        latents_mean, device=latents.device, dtype=latents.dtype
+    )
+    latents_std = torch.as_tensor(
+        latents_std, device=latents.device, dtype=latents.dtype
+    )
+    # Wan VAEs store precision (1/sigma); invert to get std.
+    latents_std = torch.where(
+        latents_std != 0,
+        1.0 / latents_std,
+        torch.ones_like(latents_std),
+    )
+    channel_dim = latents_mean.shape[0]
+    view_shape = (1, channel_dim) + (1,) * (latents.ndim - 2)
+    return latents_mean.view(view_shape), latents_std.view(view_shape)
 
 
 def sd3_time_shift(shift, t):
@@ -107,93 +146,168 @@ def assert_eq(x, y, msg=None):
     assert x == y, f"{msg or 'Assertion failed'}: {x} != {y}"
 
 
+def _prepare_sampling_schedule(args, device):
+    """
+    Wan Ti2V checkpoints are distributed with a UniPC scheduler whose sigmas
+    and timesteps need to be respected; otherwise the model receives noise
+    levels it was never trained on.  We cache the scheduler on the args
+    namespace to avoid reloading it from disk every sampling call.
+    """
+    scheduler = getattr(args, "_wan_scheduler", None)
+    if scheduler is None:
+        scheduler = UniPCMultistepScheduler.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="scheduler",
+            local_files_only=True,
+        )
+        setattr(args, "_wan_scheduler", scheduler)
+    scheduler.set_timesteps(args.sampling_steps, device=device)
+    sigma_schedule = getattr(scheduler, "sigmas", None)
+    if sigma_schedule is None:
+        sigma_schedule = torch.linspace(
+            1, 0, args.sampling_steps + 1, device=device, dtype=torch.float32
+        )
+        sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
+        timesteps = torch.linspace(
+            args.sampling_steps - 1,
+            0,
+            steps=args.sampling_steps,
+            device=device,
+            dtype=torch.float32,
+        )
+        timesteps = (timesteps / timesteps.max().clamp_min(1.0) * 1000).to(torch.long)
+        init_sigma = float(sigma_schedule[0].item())
+        return sigma_schedule, timesteps, init_sigma
+    sigma_schedule = sigma_schedule.to(device=device, dtype=torch.float32)
+    if sigma_schedule.shape[0] == args.sampling_steps:
+        sigma_schedule = torch.cat([sigma_schedule, sigma_schedule.new_zeros(1)], dim=0)
+    timesteps = scheduler.timesteps.to(device=device)
+    init_sigma = float(getattr(scheduler, "init_noise_sigma", sigma_schedule[0].item()))
+    return sigma_schedule, timesteps, init_sigma, scheduler
+
+
 def run_sample_step(
     args,
     z,
-    first_frame_latents,
     progress_bar,
     sigma_schedule,
+    timestep_schedule,
+    scheduler,
     transformer,
     encoder_hidden_states,
-    encoder_attention_mask,
+    negative_prompt_embeds,
     grpo_sample,
-    empty_cond_hidden_states,
-    empty_cond_attention_mask,
 ):
-    if grpo_sample:
-        all_latents = [z]
-        all_log_probs = []
-        for i in progress_bar:  # Add progress bar
-            B = encoder_hidden_states.shape[0]
-            sigma = sigma_schedule[i]
-            # dsigma = sigma_schedule[i + 1] - sigma
-            timestep_value = int(sigma * 1000)
-            timesteps = torch.full(
-                [encoder_hidden_states.shape[0]],
-                timestep_value,
-                device=z.device,
-                dtype=torch.long,
-            )
-            # with torch.no_grad():
-            transformer.eval()
-            with torch.autocast("cuda", torch.bfloat16):
-                if args.cfg_infer > 1:
-                    image_latents = first_frame_latents.repeat(
-                        (2,) + (1,) * (z.dim() - 1)
-                    )
-                    latent_z = z.repeat((2,) + (1,) * (z.dim() - 1))
-                    input_latents = torch.cat([latent_z, image_latents], dim=1)
-                    model_pred = transformer(
-                        hidden_states=input_latents,
-                        encoder_hidden_states=torch.cat(
-                            (encoder_hidden_states, empty_cond_hidden_states), dim=0
-                        ),
-                        timestep=timesteps.repeat((2,) + (1,) * (timesteps.dim() - 1)),
-                        guidance=torch.tensor(
-                            [1000.0] * 2, device=z.device, dtype=torch.bfloat16
-                        ),
-                        encoder_attention_mask=torch.cat(
-                            (encoder_attention_mask, empty_cond_attention_mask), dim=0
-                        ),  # B, L
-                        return_dict=False,
-                    )[0]
-                    model_pred, uncond_pred = model_pred.chunk(2)
+    if not grpo_sample:
+        zero = torch.zeros(1, device=z.device)
+        return z, z, zero, zero
 
-                    pred = uncond_pred.to(torch.float32) + args.cfg_infer * (
-                        model_pred.to(torch.float32) - uncond_pred.to(torch.float32)
-                    )
-                else:
-                    latents = torch.cat([z, first_frame_latents], dim=1)
-                    pred = transformer(
-                        hidden_states=latents,
-                        encoder_hidden_states=encoder_hidden_states,
-                        timestep=timesteps,
-                        guidance=torch.tensor(
-                            [1000.0], device=z.device, dtype=torch.bfloat16
-                        ),
-                        encoder_attention_mask=encoder_attention_mask,  # B, L
-                        return_dict=False,
-                    )[0]
-            # z = z + dsigma * pred
-            z, pred_original, log_prob = flux_step(
-                pred,
-                z.to(torch.float32),
-                args.eta,
-                sigmas=sigma_schedule,
-                index=i,
-                prev_sample=None,
-                grpo=True,
-                sde_solver=True,
+    all_latents = [z]
+    all_log_probs = []
+
+    compare_scheduler = getattr(args, "compare_scheduler", False) and not getattr(
+        args, "_scheduler_compare_done", False
+    )
+    # if compare_scheduler and dist.is_initialized() and dist.get_rank() != 0:
+    #     compare_scheduler = False
+    compare_scheduler_active = compare_scheduler
+    cmp_scheduler = None
+    cmp_latents = None
+    if compare_scheduler:
+        cmp_scheduler = UniPCMultistepScheduler.from_config(scheduler.config)
+        cmp_scheduler.set_timesteps(args.sampling_steps, device=z.device)
+        cmp_latents = z.clone().to(torch.float32)
+        compare_limit = getattr(args, "compare_scheduler_max_steps", 4)
+        tolerance = getattr(args, "compare_scheduler_tolerance", 1e-4)
+    for i in progress_bar:
+        B = encoder_hidden_states.shape[0]
+        timestep_value = timestep_schedule[i]
+        timestep_scalar = (
+            timestep_value.to(device=z.device)
+            if torch.is_tensor(timestep_value)
+            else torch.tensor(
+                timestep_value, device=z.device, dtype=timestep_schedule.dtype
             )
-            z.to(torch.bfloat16)
-            all_latents.append(z)
-            all_log_probs.append(log_prob)
-        latents = pred_original.to(torch.float32) / 0.476986
-        all_latents = torch.stack(
-            all_latents, dim=1
-        )  # (batch_size, num_steps + 1, 4, 64, 64)
-        all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
-        return z, latents, all_latents, all_log_probs
+        )
+        timesteps = torch.full(
+            [B],
+            timestep_scalar.item(),
+            device=z.device,
+            dtype=timestep_schedule.dtype,
+        )
+        transformer.eval()
+        if args.cfg_infer > 1:
+            with torch.autocast("cuda", torch.bfloat16):
+                latent_z = torch.cat([z, z], dim=0)
+                cond_states = torch.cat(
+                    [encoder_hidden_states, negative_prompt_embeds], dim=0
+                )
+                timestep_inputs = torch.cat([timesteps, timesteps], dim=0)
+                scaled_inputs = scheduler.scale_model_input(
+                    latent_z.to(torch.float32), timestep_inputs
+                ).to(torch.bfloat16)
+                pred = transformer(
+                    hidden_states=scaled_inputs,
+                    timestep=timestep_inputs,
+                    encoder_hidden_states=cond_states,
+                    attention_kwargs=None,
+                    return_dict=False,
+                )[0]
+                model_pred, uncond_pred = pred.chunk(2)
+                pred = uncond_pred.to(torch.float32) + args.cfg_infer * (
+                    model_pred.to(torch.float32) - uncond_pred.to(torch.float32)
+                )
+        else:
+            with torch.autocast("cuda", torch.bfloat16):
+                model_inputs = scheduler.scale_model_input(
+                    z.to(torch.float32), timesteps
+                ).to(torch.bfloat16)
+                pred = transformer(
+                    hidden_states=model_inputs,
+                    timestep=timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_kwargs=None,
+                    return_dict=False,
+                )[0]
+        z, pred_original, log_prob = flux_step(
+            pred,
+            z.to(torch.float32),
+            args.eta,
+            sigmas=sigma_schedule,
+            index=i,
+            prev_sample=None,
+            grpo=True,
+            sde_solver=True,
+        )
+        z = z.to(torch.bfloat16)
+        if compare_scheduler and i < compare_limit:
+            cmp_prev = cmp_scheduler.step(
+                pred.to(torch.float32),
+                timestep_scalar,
+                cmp_latents,
+                return_dict=False,
+            )[0]
+            diff = torch.max(torch.abs(cmp_prev - z.to(torch.float32))).item()
+            main_print(
+                f"[SchedulerCompare] step={i} max|Δ|={diff:.6e} (tol={tolerance})"
+            )
+            cmp_latents = cmp_prev
+            if diff > tolerance:
+                main_print(
+                    "[SchedulerCompare] Detected mismatch between flux_step and scheduler.step."
+                )
+        if compare_scheduler and i + 1 == compare_limit:
+            setattr(args, "_scheduler_compare_done", True)
+            compare_scheduler = False
+        all_latents.append(z)
+        all_log_probs.append(log_prob)
+
+    latents = pred_original
+    all_latents = torch.stack(all_latents, dim=1)
+    all_log_probs = torch.stack(all_log_probs, dim=1)
+    if compare_scheduler_active:
+        setattr(args, "_scheduler_compare_done", True)
+    return z, latents, all_latents, all_log_probs
 
 
 def grpo_one_step(
@@ -201,51 +315,45 @@ def grpo_one_step(
     latents,
     pre_latents,
     encoder_hidden_states,
-    encoder_attention_mask,
-    empty_cond_hidden_states,
-    empty_cond_attention_mask,
+    negative_prompt_embeds,
+    scheduler,
     transformer,
     timesteps,
     i,
     sigma_schedule,
-    first_frame_latents,
 ):
-    B = encoder_hidden_states.shape[0]
-    with torch.autocast("cuda", torch.bfloat16):
-        transformer.train()
-        if args.cfg_infer > 1:
-            image_latents = first_frame_latents.repeat(
-                (2,) + (1,) * (latents.dim() - 1)
+    transformer.train()
+    if args.cfg_infer > 1:
+        with torch.autocast("cuda", torch.bfloat16):
+            latent_z = torch.cat([latents, latents], dim=0)
+            timestep_inputs = torch.cat([timesteps, timesteps], dim=0)
+            cond_states = torch.cat(
+                [encoder_hidden_states, negative_prompt_embeds], dim=0
             )
-            latent_z = latents.repeat((2,) + (1,) * (latents.dim() - 1))
-            input_latents = torch.cat([latent_z, image_latents], dim=1)
-            model_pred = transformer(
-                hidden_states=input_latents,
-                encoder_hidden_states=torch.cat(
-                    (encoder_hidden_states, empty_cond_hidden_states), dim=0
-                ),
-                timestep=timesteps.repeat((2,) + (1,) * (timesteps.dim() - 1)),
-                guidance=torch.tensor(
-                    [1000.0] * 2, device=latents.device, dtype=torch.bfloat16
-                ),
-                encoder_attention_mask=torch.cat(
-                    (encoder_attention_mask, empty_cond_attention_mask), dim=0
-                ),  # B, L
+            scaled_inputs = scheduler.scale_model_input(
+                latent_z.to(torch.float32), timestep_inputs
+            ).to(torch.bfloat16)
+            pred = transformer(
+                hidden_states=scaled_inputs,
+                timestep=timestep_inputs,
+                encoder_hidden_states=cond_states,
+                attention_kwargs=None,
                 return_dict=False,
             )[0]
-            model_pred, uncond_pred = model_pred.chunk(2)
+            model_pred, uncond_pred = pred.chunk(2)
             pred = uncond_pred.to(torch.float32) + args.cfg_infer * (
                 model_pred.to(torch.float32) - uncond_pred.to(torch.float32)
             )
-        else:
+    else:
+        with torch.autocast("cuda", torch.bfloat16):
+            model_inputs = scheduler.scale_model_input(
+                latents.to(torch.float32), timesteps
+            ).to(torch.bfloat16)
             pred = transformer(
-                hidden_states=torch.cat([latents, first_frame_latents], dim=1),
-                encoder_hidden_states=encoder_hidden_states,
+                hidden_states=model_inputs,
                 timestep=timesteps,
-                guidance=torch.tensor(
-                    [1000.0], device=latents.device, dtype=torch.bfloat16
-                ),
-                encoder_attention_mask=encoder_attention_mask,  # B, L
+                encoder_hidden_states=encoder_hidden_states,
+                attention_kwargs=None,
                 return_dict=False,
             )[0]
     z, pred_original, log_prob = flux_step(
@@ -263,167 +371,182 @@ def grpo_one_step(
 
 def sample_reference_model(
     args,
-    step,
     device,
     transformer,
-    pipe_flux,
     vae,
     encoder_hidden_states,
-    encoder_attention_mask,
-    empty_cond_hidden_states,
-    empty_cond_attention_mask,
-    inferencer,
+    negative_prompt_embeds,
     caption,
+    inferencer=None,
 ):
-    video_processor = VideoProcessor(vae_scale_factor=8)
-
     w, h, t = args.w, args.h, args.t
     sample_steps = args.sampling_steps
-    sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1)
-    sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
-
+    (
+        sigma_schedule,
+        timestep_schedule,
+        init_noise_sigma,
+        scheduler,
+    ) = _prepare_sampling_schedule(args, device)
     assert_eq(
-        len(sigma_schedule),
+        sigma_schedule.shape[0],
         sample_steps + 1,
-        "sigma_schedule must have length sample_steps + 1",
+        "sigma schedule must match step count",
     )
+    noise_scale = torch.as_tensor(init_noise_sigma, device=device, dtype=torch.float32)
 
-    B = encoder_hidden_states.shape[0]
-    SPATIAL_DOWNSAMPLE = 8
-    TEMPORAL_DOWNSAMPLE = 4
-    IN_CHANNELS = 16
-    latent_t = ((t - 1) // TEMPORAL_DOWNSAMPLE) + 1
-    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
+    transformer_config = getattr(_unwrap_module(transformer), "config", None)
+    vae_scale_factor = vae.config.scale_factor_spatial // vae.config.patch_size
+    if vae_scale_factor is None:
+        vae_scale_factor = WAN5B_SPATIAL_DOWNSAMPLE
+    vae_scale_factor = int(vae_scale_factor)
+    temporal_downsample = vae.config.scale_factor_temporal
+    if temporal_downsample in (None, 0):
+        temporal_downsample = WAN5B_TEMPORAL_DOWNSAMPLE
+    temporal_downsample = int(temporal_downsample)
+    latent_channels = getattr(
+        getattr(transformer_config, "config", transformer_config), "in_channels", None
+    )
+    if latent_channels is None:
+        latent_channels = getattr(transformer_config, "in_channels", WAN5B_CHANNELS)
+    latent_channels = int(latent_channels)
 
-    batch_size = 1
-    batch_indices = torch.chunk(torch.arange(B), B // batch_size)
+    latent_t = ((t - 1) // temporal_downsample) + 1
+    latent_h = h // vae_scale_factor
+    latent_w = w // vae_scale_factor
 
     vae.enable_tiling()
+    video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)
+
+    B = encoder_hidden_states.shape[0]
+    batch_size = 1
+    batch_indices = torch.chunk(torch.arange(B, device=device), max(1, B // batch_size))
+
+    save_videos = getattr(args, "save_videos", True)
+    video_output_dir = None
+    video_filename_prefix = getattr(args, "video_filename_prefix", "wan5b")
+    video_output_dir_arg = getattr(args, "video_output_dir", "./videos")
+    video_fps = getattr(args, "video_fps", getattr(args, "fps", 24))
+    if save_videos:
+        video_output_dir = Path(video_output_dir_arg)
+        video_output_dir.mkdir(parents=True, exist_ok=True)
+        if not hasattr(args, "_video_save_counter"):
+            setattr(args, "_video_save_counter", 0)
+
+    def _sample_latents(batch_latent_shape):
+        noise = torch.randn(
+            batch_latent_shape,
+            device=device,
+            dtype=torch.float32,
+        )
+        noise = noise * noise_scale
+        return noise.to(torch.bfloat16)
+
+    if args.init_same_noise:
+        input_latents = _sample_latents(
+            (1, latent_channels, latent_t, latent_h, latent_w)
+        )
+
     all_latents = []
     all_log_probs = []
     all_rewards = []
-    grpo_sample = True
-    pipe_flux.to(device)
-    image = pipe_flux(
-        caption[0],
-        height=args.h,
-        width=args.w,
-        guidance_scale=3.5,
-        num_inference_steps=30,
-        max_sequence_length=512,
-    ).images[0]
-    pipe_flux.to("cpu")
-
-    img_save_path = f"./videos/flux_{dist.get_rank()}.jpg"
-    image.save(img_save_path)
-
-    image = Image.open(img_save_path).convert("RGB")
-
-    preprocess = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ]
-    )
-
-    image_tensor = preprocess(image).unsqueeze(0).to(vae.device)
-
-    with torch.no_grad():
-        first_frame_latents = (
-            vae.encode(image_tensor.unsqueeze(2)).latent_dist.sample() * 0.476986
-        )
-
-    padding_shape = (
-        batch_size,
-        IN_CHANNELS,
-        latent_t - 1,
-        latent_h,
-        latent_w,
-    )
-    latent_padding = torch.zeros(padding_shape, device=device, dtype=torch.bfloat16)
-    first_frame_latents = torch.cat([first_frame_latents, latent_padding], dim=2)
-
-    if args.init_same_noise:
-        input_latents = torch.randn(
-            (1, IN_CHANNELS, latent_t, latent_h, latent_w),  # （1, c,t,h,w)
-            device=device,
-            dtype=torch.bfloat16,
-        )
     for index, batch_idx in enumerate(batch_indices):
         batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
-        batch_encoder_attention_mask = encoder_attention_mask[batch_idx]
-        batch_caption = [caption[i] for i in batch_idx]
-        grpo_sample = True
-        progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress")
+        batch_negative_prompt_embeds = negative_prompt_embeds[batch_idx]
+        batch_caption = [caption[i] for i in batch_idx.tolist()]
+
         if not args.init_same_noise:
-            input_latents = torch.randn(
-                (1, IN_CHANNELS, latent_t, latent_h, latent_w),  # （1, c,t,h,w)
-                device=device,
-                dtype=torch.bfloat16,
+            input_latents = _sample_latents(
+                (1, latent_channels, latent_t, latent_h, latent_w)
             )
 
+        progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress")
         with torch.no_grad():
             z, latents, batch_latents, batch_log_probs = run_sample_step(
                 args,
                 input_latents.clone(),
-                first_frame_latents.clone(),
                 progress_bar,
                 sigma_schedule,
+                timestep_schedule,
+                scheduler,
                 transformer,
                 batch_encoder_hidden_states,
-                batch_encoder_attention_mask,
-                grpo_sample,
-                empty_cond_hidden_states,
-                empty_cond_attention_mask,
+                batch_negative_prompt_embeds,
+                True,
             )
 
-        # 累积所有批次的latents和log_probs
         all_latents.append(batch_latents)
         all_log_probs.append(batch_log_probs)
 
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                video = vae.decode(latents, return_dict=False)[0]
-                videos = video_processor.postprocess_video(video)
-        rank = int(os.environ["RANK"])
+                latents_mean, latents_std = _reshape_vae_latent_stats(vae, latents)
+                decode_latents = latents
+                if latents_mean is not None and latents_std is not None:
+                    decode_latents = decode_latents / latents_std + latents_mean
+                video = vae.decode(decode_latents, return_dict=False)[0]
+                decoded_video = video_processor.postprocess_video(video)
 
-        from diffusers.utils import export_to_video
+        if len(decoded_video) == 0:
+            continue
 
-        export_to_video(
-            videos[0], f"./videos/skyreels_{rank}_{index}.mp4", fps=args.fps
-        )
+        video_frames = decoded_video[0]
+        if not isinstance(video_frames, np.ndarray):
+            video_frames = np.array(video_frames)
 
-        if args.use_videoalign:
+        color_format = getattr(args, "video_color_format", "rgb").lower()
+        if video_frames.ndim == 5:
+            video_frames = video_frames[0]
+        if video_frames.ndim == 4 and video_frames.shape[1] in (1, 3, 4):
+            video_frames = np.transpose(video_frames, (0, 2, 3, 1))
+        if color_format == "bgr" and video_frames.shape[-1] == 3:
+            video_frames = video_frames[..., ::-1]
+
+        if np.issubdtype(video_frames.dtype, np.floating):
+            video_frames = np.clip(video_frames, 0.0, 1.0)
+        else:
+            video_frames = video_frames.astype(np.float32) / 255.0
+
+        video_path = None
+        if save_videos and video_output_dir is not None:
+            video_id = getattr(args, "_video_save_counter", 0)
+            setattr(args, "_video_save_counter", video_id + 1)
+            rank = int(os.environ.get("RANK", 0))
+            video_filename = (
+                f"{video_filename_prefix}_rank{rank}_sample{video_id}_idx{index}.mp4"
+            )
+            video_path = video_output_dir / video_filename
+            export_to_video(video_frames, str(video_path), fps=video_fps)
+
+        if args.use_videoalign and inferencer is not None:
             with torch.no_grad():
                 try:
-                    # print("starting video align")
-                    absolute_path = os.path.abspath(
-                        f"./videos/skyreels_{rank}_{index}.mp4"
-                    )
-                    # print("starting video align")
-                    reward = inferencer.reward(
-                        [absolute_path],
-                        [batch_caption[0]],
-                        use_norm=True,
-                    )
-                    reward = torch.tensor(reward[0]["MQ"]).to(device)
-                    all_rewards.append(reward.unsqueeze(0))
-                except Exception as e:
-                    reward = torch.tensor(-1.0).to(device)
-                    all_rewards.append(reward.unsqueeze(0))
+                    if video_path is not None:
+                        absolute_path = os.path.abspath(str(video_path))
+                        reward = inferencer.reward(
+                            [absolute_path],
+                            [batch_caption[0]],
+                            use_norm=True,
+                        )
+                        reward = torch.tensor(reward[0]["MQ"]).to(device)
+                    else:
+                        reward = torch.tensor(0.0, device=device)
+                except Exception:
+                    reward = torch.tensor(-1.0, device=device)
+        else:
+            reward = torch.tensor(0.0, device=device)
+        all_rewards.append(reward.unsqueeze(0))
 
     all_latents = torch.cat(all_latents, dim=0)
     all_log_probs = torch.cat(all_log_probs, dim=0)
     all_rewards = torch.cat(all_rewards, dim=0)
 
     return (
-        videos,
-        z,
         all_rewards,
         all_latents,
         all_log_probs,
         sigma_schedule,
-        first_frame_latents,
+        timestep_schedule,
+        scheduler,
     )
 
 
@@ -440,24 +563,32 @@ def train_one_step(
     args,
     device,
     transformer,
-    pipe_flux,
     vae,
     inferencer,
     optimizer,
     lr_scheduler,
     loader,
     max_grad_norm,
-    step,
-    empty_cond_hidden_states,
-    empty_cond_attention_mask,
 ):
     total_loss = 0.0
     optimizer.zero_grad()
-    (
-        encoder_hidden_states,
-        encoder_attention_mask,
-        caption,
-    ) = next(loader)
+    batch = next(loader)
+    if len(batch) == 4:
+        (
+            encoder_hidden_states,
+            negative_prompt_embeds,
+            caption,
+            image_meta,
+        ) = batch
+    else:
+        encoder_hidden_states, negative_prompt_embeds, caption = batch
+        image_meta = None
+    encoder_hidden_states = encoder_hidden_states.to(
+        device=device, dtype=torch.bfloat16
+    )
+    negative_prompt_embeds = negative_prompt_embeds.to(
+        device=device, dtype=torch.bfloat16
+    )
     # device = latents.device
     if args.use_group:
 
@@ -467,7 +598,7 @@ def train_one_step(
             return torch.repeat_interleave(tensor, args.num_generations, dim=0)
 
         encoder_hidden_states = repeat_tensor(encoder_hidden_states)
-        encoder_attention_mask = repeat_tensor(encoder_attention_mask)
+        negative_prompt_embeds = repeat_tensor(negative_prompt_embeds)
 
         if isinstance(caption, str):
             caption = [caption] * args.num_generations
@@ -476,39 +607,29 @@ def train_one_step(
         else:
             raise ValueError(f"Unsupported caption type: {type(caption)}")
 
-    empty_cond_hidden_states = empty_cond_hidden_states.unsqueeze(0)
-    empty_cond_attention_mask = empty_cond_attention_mask.unsqueeze(0)
+    B = encoder_hidden_states.shape[0]
+    negative_prompt_embeds = negative_prompt_embeds[:B]
+
     (
-        videos,
-        latents,
         reward,
         all_latents,
         all_log_probs,
         sigma_schedule,
-        first_frame_latents,
+        timestep_schedule,
+        scheduler,
     ) = sample_reference_model(
         args,
-        step,
         device,
         transformer,
-        pipe_flux,
         vae,
         encoder_hidden_states,
-        encoder_attention_mask,
-        empty_cond_hidden_states,
-        empty_cond_attention_mask,
-        inferencer,
+        negative_prompt_embeds,
         caption,
+        inferencer,
     )
     batch_size = all_latents.shape[0]
-    timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][
-        : args.sampling_steps
-    ]
-    timestep_values = [timestep_value[:] for _ in range(batch_size)]
-    device = all_latents.device
-    timesteps = torch.tensor(
-        timestep_values, device=all_latents.device, dtype=torch.long
-    )
+    timestep_values = timestep_schedule.to(all_latents.device)
+    timesteps = timestep_values.unsqueeze(0).repeat(batch_size, 1)
     samples = {
         "timesteps": timesteps.detach().clone()[:, :-1],
         "latents": all_latents[:, :-1][
@@ -520,9 +641,7 @@ def train_one_step(
         "log_probs": all_log_probs[:, :-1],
         "rewards": reward.to(torch.float32),
         "encoder_hidden_states": encoder_hidden_states,
-        "encoder_attention_mask": encoder_attention_mask,
-        "empty_cond_hidden_states": empty_cond_hidden_states.repeat(batch_size, 1, 1),
-        "empty_cond_attention_mask": empty_cond_attention_mask.repeat(batch_size, 1),
+        "negative_prompt_embeds": negative_prompt_embeds,
     }
     gathered_reward = gather_tensor(samples["rewards"])
     if dist.get_rank() == 0:
@@ -574,14 +693,12 @@ def train_one_step(
                 sample["latents"][:, _],
                 sample["next_latents"][:, _],
                 sample["encoder_hidden_states"],
-                sample["encoder_attention_mask"],
-                sample["empty_cond_hidden_states"],
-                sample["empty_cond_attention_mask"],
+                sample["negative_prompt_embeds"],
+                scheduler,
                 transformer,
                 sample["timesteps"][:, _],
                 perms[i][_],
                 sigma_schedule,
-                first_frame_latents,
             )
 
             advantages = torch.clamp(
@@ -644,6 +761,7 @@ def main(args):
 
     # For mixed precision training we cast all non-trainable weigths to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
+    inferencer = None
     if args.use_videoalign:
         from fastvideo.models.videoalign.inference import VideoVLMRewardInference
 
@@ -696,23 +814,6 @@ def main(args):
     # Set model as trainable.
     transformer.train()
 
-    pipe_flux = FluxPipeline.from_pretrained(
-        "./data/flux", torch_dtype=torch.bfloat16
-    ).to(device)
-    """
-    fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
-        pipe_flux.transformer,
-        args.fsdp_sharding_startegy,
-        False,
-        args.use_cpu_offload,
-        args.master_weight_type,
-    )
-    
-    pipe_flux.transformer = FSDP(pipe_flux.transformer, **fsdp_kwargs,).eval()
-    pipe_flux.vae.to(device)
-    pipe_flux.text_encoder.to(device)
-    #@reward_model.eval()
-    """
     params_to_optimize = transformer.parameters()
     params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
 
@@ -767,6 +868,10 @@ def main(args):
     vae, autocast_type, fps = load_vae(args.model_type, args.vae_model_path)
     # vae.enable_tiling()
 
+    print("vae scale factor", vae.config.scale_factor_spatial)
+    print("vae latent mean", vae.config.latents_mean)
+    print("vae latent std", vae.config.latents_std)
+
     if rank <= 0:
         project = args.tracker_project_name or "fastvideo"
         wandb.init(project=project, config=args)
@@ -816,17 +921,6 @@ def main(args):
     )
 
     step_times = deque(maxlen=100)
-    empty_cond_hidden_states = torch.load(
-        "./data/empty/prompt_embed/0.pt",
-        map_location=torch.device(f"cuda:{device}"),
-        weights_only=True,
-    )
-    empty_cond_attention_mask = torch.load(
-        "./data/empty/prompt_attention_mask/0.pt",
-        map_location=torch.device(f"cuda:{device}"),
-        weights_only=True,
-    )
-
     # todo future
     # for i in range(init_steps):
     #    next(loader)
@@ -843,16 +937,12 @@ def main(args):
                 args,
                 device,
                 transformer,
-                pipe_flux,
                 vae,
                 inferencer,
                 optimizer,
                 lr_scheduler,
                 loader,
                 args.max_grad_norm,
-                step,
-                empty_cond_hidden_states,
-                empty_cond_attention_mask,
             )
 
             step_time = time.time() - start_time
@@ -888,12 +978,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_type",
         type=str,
-        default="hunyuan_hf",
+        default="wan2.2_ti2v",
         help="The type of model to train.",
     )
     # dataset & dataloader
     parser.add_argument("--data_json_path", type=str, required=True)
-    parser.add_argument("--num_frames", type=int, default=163)
+    parser.add_argument("--num_frames", type=int, default=121)
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -903,20 +993,33 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=16,
+        default=1,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
-        "--num_latent_t", type=int, default=28, help="Number of latent timesteps."
+        "--num_latent_t", type=int, default=31, help="Number of latent timesteps."
     )
     parser.add_argument("--group_frame", action="store_true")  # TODO
     parser.add_argument("--group_resolution", action="store_true")  # TODO
 
     # text encoder & vae & diffusion model
-    parser.add_argument("--pretrained_model_name_or_path", type=str)
-    parser.add_argument("--reference_model_path", type=str)
+    parser.add_argument(
+        "--pretrained_model_name_or_path", type=str, default="data/Wan2.2-5B"
+    )
+    parser.add_argument("--reference_model_path", type=str, default="data/flux")
+    parser.add_argument(
+        "--conditioning_image_path",
+        type=str,
+        default=None,
+        help="Optional path to a conditioning image for I2V first frame; if set, Flux is not used.",
+    )
     parser.add_argument("--dit_model_name_or_path", type=str, default=None)
-    parser.add_argument("--vae_model_path", type=str, default=None, help="vae model.")
+    parser.add_argument(
+        "--vae_model_path",
+        type=str,
+        default="data/Wan2.2-5B/Wan2.2_VAE.pth",
+        help="vae model.",
+    )
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
 
     # diffusion setting
@@ -1146,44 +1249,64 @@ if __name__ == "__main__":
     parser.add_argument(
         "--weight_path",
         type=str,
-        default=None,
+        default=704,
         help="Reward model path",
     )
     parser.add_argument(
         "--h",
         type=int,
-        default=None,
+        default=1280,
         help="video height",
     )
     parser.add_argument(
         "--w",
         type=int,
-        default=None,
+        default=121,
         help="video width",
     )
     parser.add_argument(
         "--t",
         type=int,
-        default=None,
+        default=30,
         help="video length",
     )
     parser.add_argument(
         "--sampling_steps",
         type=int,
-        default=None,
+        default=0.3,
         help="sampling steps",
     )
     parser.add_argument(
         "--eta",
         type=float,
-        default=None,
+        default=24,
         help="noise eta",
     )
     parser.add_argument(
         "--fps",
         type=int,
-        default=None,
+        default=1223627,
         help="fps of stored video",
+    )
+    sampling_group = parser.add_mutually_exclusive_group()
+    sampling_group.add_argument(
+        "--simple_sampling",
+        dest="simple_sampling",
+        action="store_true",
+        help="Use Wan2.1-style sampling without first-frame conditioning.",
+    )
+    sampling_group.add_argument(
+        "--no_simple_sampling",
+        dest="simple_sampling",
+        action="store_false",
+        help="Use the original scheduler + first-frame conditioning.",
+    )
+    sampling_group.set_defaults(simple_sampling=True)
+    parser.add_argument(
+        "--video_output_dir",
+        type=str,
+        default="./videos",
+        help="Directory where generated videos are stored.",
     )
     parser.add_argument(
         "--sampler_seed",
@@ -1200,7 +1323,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_generations",
         type=int,
-        default=16,
+        default=8,
         help="num_generations per prompt",
     )
     parser.add_argument(
@@ -1224,8 +1347,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cfg_infer",
         type=float,
-        default=1.0,
+        default=5.0,
         help="cfg",
+    )
+    parser.add_argument(
+        "--compare_scheduler",
+        action="store_true",
+        help="Compare custom sampler updates against UniPC scheduler.step and log differences.",
+    )
+    parser.add_argument(
+        "--compare_scheduler_tolerance",
+        type=float,
+        default=1e-4,
+        help="Tolerance for max absolute difference when comparing against UniPC scheduler.",
+    )
+    parser.add_argument(
+        "--compare_scheduler_max_steps",
+        type=int,
+        default=4,
+        help="Number of steps to compare when --compare_scheduler is enabled.",
     )
     parser.add_argument(
         "--shift",

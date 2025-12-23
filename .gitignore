@@ -1,0 +1,11 @@
+data/*
+fastvideo/dataset/__pycache__/*
+fastvideo/distill/__pycache__/*
+fastvideo/models/__pycache__/*
+fastvideo/utils/__pycache__/*
+videoalign_ckpt/*
+Qwen2-VL-2B-Instruct/*
+wandb/*
+videos/*
+conditioning_previews/*
+assets/*

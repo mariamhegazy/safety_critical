@@ -1,0 +1,9 @@
+Looking in indexes: https://pypi.org/simple, https://pypi.ngc.nvidia.com
+Requirement already satisfied: xformers in /usr/local/lib/python3.10/dist-packages (0.0.29+f3bc7a78.d20250701)
+Collecting xformers
+  Downloading xformers-0.0.33.post2.tar.gz (14.8 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 14.8/14.8 MB 120.1 MB/s eta 0:00:00
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'error'

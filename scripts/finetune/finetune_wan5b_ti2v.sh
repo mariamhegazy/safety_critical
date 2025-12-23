@@ -61,14 +61,14 @@ torchrun --nnodes=4 --nproc_per_node=8 --node_rank=0 --master_addr=192.168.0.101
 
 
 torchrun --nnodes=1 --nproc_per_node=4 \
-    fastvideo/train_grpo_skyreels_i2v.py \
+    fastvideo/train_grpo_wan5b_ti2v.py \
     --seed 42 \
-    --model_type "hunyuan_hf" \
-    --pretrained_model_name_or_path data/SkyReels-I2V \
+    --model_type "wan2.2_ti2v" \
+    --pretrained_model_name_or_path data/wan2.2-ti2v-5b-diffusers \
     --reference_model_path data/flux \
-    --vae_model_path data/SkyReels-I2V \
+    --vae_model_path data/wan2.2-ti2v-5b-diffusers \
     --cache_dir data/.cache \
-    --data_json_path data/rl_embeddings/videos2caption.json \
+    --data_json_path data/rl_embeddings_wan22/videos2caption.json \
     --gradient_checkpointing \
     --train_batch_size 1 \
     --sp_size 1 \
@@ -83,22 +83,29 @@ torchrun --nnodes=1 --nproc_per_node=4 \
     --checkpoints_total_limit 3 \
     --allow_tf32 \
     --cfg 0.0 \
-    --output_dir data/outputs/grpo \
-    --tracker_project_name skyreels_i2v \
-    --h 400 \
+    --output_dir data/outputs/grpo_wan5b \
+    --tracker_project_name wan2.2_5B \
+    --h 416 \
     --w 640 \
-    --t 53 \
+    --t 30 \
     --sampling_steps 16 \
     --eta 0.3 \
     --lr_warmup_steps 0 \
-    --fps 8 \
+    --fps 24 \
     --sampler_seed 1237 \
     --max_grad_norm 1.0 \
     --weight_decay 0.0001 \
     --num_generations 8 \
     --cfg_infer 5.0 \
-    --shift 7 \
+    --shift 3 \
     --use_group \
     --timestep_fraction 0.6 \
     --use_videoalign \
-    --init_same_noise 
+    --init_same_noise \
+
+
+
+# export NCCL_IB_DISABLE=1
+# export NCCL_NET=Socket
+# export NCCL_SOCKET_IFNAME=eth0   # or whatever your host NIC is
+# export NCCL_DEBUG=WARN

@@ -9,3 +9,11 @@ torchrun --nproc_per_node=$GPU_NUM --master_port 19002 \
     --model_path $MODEL_PATH \
     --output_dir $OUTPUT_DIR \
     --prompt_dir "./assets/prompts.txt"
+
+
+
+torchrun --nproc_per_node=4 --master_port 19002 \
+    fastvideo/data_preprocess/preprocess_wan_2_1_embeddings.py \
+    --model_path "./data/Wan2.1-T2V-1.3B" \
+    --output_dir "data/rl_embeddings" \
+    --prompt_dir "./assets/prompts_subset.txt"

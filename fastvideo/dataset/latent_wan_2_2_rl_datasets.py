@@ -28,8 +28,8 @@ class LatentDataset(Dataset):
         #self.video_dir = os.path.join(self.datase_dir_path, "video")
         #self.latent_dir = os.path.join(self.datase_dir_path, "latent")
         self.prompt_embed_dir = os.path.join(self.datase_dir_path, "prompt_embed")
-        self.prompt_attention_mask_dir = os.path.join(
-            self.datase_dir_path, "prompt_attention_mask"
+        self.negative_prompt_embeds_dir = os.path.join(
+            self.datase_dir_path, "negative_prompt_embeds"
         )
         with open(self.json_path, "r") as f:
             self.data_anno = json.load(f)
@@ -44,44 +44,68 @@ class LatentDataset(Dataset):
             data_item["length"] if "length" in data_item else 1
             for data_item in self.data_anno
         ]
+        self._has_image_conditioning = False
+        for item in self.data_anno:
+            conditioning = item.get("image_conditioning")
+            if isinstance(conditioning, dict):
+                source_path = conditioning.get("source_path")
+                if source_path:
+                    self._has_image_conditioning = True
+                    item["_image_conditioning_meta"] = {
+                        "path": source_path,
+                        "width": conditioning.get("width"),
+                        "height": conditioning.get("height"),
+                    }
 
     def __getitem__(self, idx):
         #latent_file = self.data_anno[idx]["latent_path"]
         prompt_embed_file = self.data_anno[idx]["prompt_embed_path"]
-        prompt_attention_mask_file = self.data_anno[idx]["prompt_attention_mask"]
+        negative_prompt_embeds_file = self.data_anno[idx]["negative_prompt_embeds_path"]
         if random.random() < self.cfg_rate:
             prompt_embed = self.uncond_prompt_embed
-            prompt_attention_mask = self.uncond_prompt_mask
+            negative_prompt_embeds = self.uncond_prompt_mask
         else:
             prompt_embed = torch.load(
                 os.path.join(self.prompt_embed_dir, prompt_embed_file),
                 map_location="cpu",
                 weights_only=True,
             )
-            prompt_attention_mask = torch.load(
+            negative_prompt_embeds = torch.load(
                 os.path.join(
-                    self.prompt_attention_mask_dir, prompt_attention_mask_file
+                    self.negative_prompt_embeds_dir, negative_prompt_embeds_file
                 ),
                 map_location="cpu",
                 weights_only=True,
             )
-        return prompt_embed, prompt_attention_mask, self.data_anno[idx]['caption']
+        image_meta = self.data_anno[idx].get("_image_conditioning_meta")
+        if self._has_image_conditioning:
+            return (
+                prompt_embed,
+                negative_prompt_embeds,
+                self.data_anno[idx]["caption"],
+                image_meta,
+            )
+        return prompt_embed, negative_prompt_embeds, self.data_anno[idx]["caption"]
 
     def __len__(self):
         return len(self.data_anno)
 
 
 def latent_collate_function(batch):
+    if len(batch[0]) == 4:
+        prompt_embeds, prompt_attention_masks, caption, image_meta = zip(*batch)
+    else:
+        prompt_embeds, prompt_attention_masks, caption = zip(*batch)
+        image_meta = None
     # return latent, prompt, latent_attn_mask, text_attn_mask
     # latent_attn_mask: # b t h w
     # text_attn_mask: b 1 l
     # needs to check if the latent/prompt' size and apply padding & attn mask
-    prompt_embeds, prompt_attention_masks, caption = zip(*batch)
     # attn mask
     prompt_embeds = torch.stack(prompt_embeds, dim=0)
     prompt_attention_masks = torch.stack(prompt_attention_masks, dim=0)
-    #latents = torch.stack(latents, dim=0)
-    return prompt_embeds, prompt_attention_masks, caption
+    image_meta = list(image_meta) if image_meta is not None else None
+    return prompt_embeds, prompt_attention_masks, caption, image_meta
 
 
 if __name__ == "__main__":
@@ -89,12 +113,18 @@ if __name__ == "__main__":
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=2, shuffle=False, collate_fn=latent_collate_function
     )
-    for prompt_embed, prompt_attention_mask, caption in dataloader:
+    for batch in dataloader:
+        if len(batch) == 4:
+            prompt_embed, prompt_attention_mask, caption, image_latents = batch
+        else:
+            prompt_embed, prompt_attention_mask, caption = batch
+            image_latents = None
         print(
             prompt_embed.shape,
             prompt_attention_mask.shape,
-            caption
+            caption,
+            None if image_latents is None else image_latents.shape,
         )
         import pdb
 
-        pdb.set_trace()        pdb.set_trace()
+        pdb.set_trace()

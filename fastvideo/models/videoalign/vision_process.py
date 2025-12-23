@@ -20,7 +20,6 @@ from PIL import Image
 from torchvision import io, transforms
 from torchvision.transforms import InterpolationMode
 
-
 logger = logging.getLogger(__name__)
 
 IMAGE_FACTOR = 28
@@ -53,7 +52,11 @@ def floor_by_factor(number: int, factor: int) -> int:
 
 
 def smart_resize(
-    height: int, width: int, factor: int = IMAGE_FACTOR, min_pixels: int = MIN_PIXELS, max_pixels: int = MAX_PIXELS
+    height: int,
+    width: int,
+    factor: int = IMAGE_FACTOR,
+    min_pixels: int = MIN_PIXELS,
+    max_pixels: int = MAX_PIXELS,
 ) -> tuple[int, int]:
     """
     Rescales the image so that the following conditions are met:
@@ -81,7 +84,9 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def fetch_image(ele: dict[str, str | Image.Image], size_factor: int = IMAGE_FACTOR) -> Image.Image:
+def fetch_image(
+    ele: dict[str, str | Image.Image], size_factor: int = IMAGE_FACTOR
+) -> Image.Image:
     if "image" in ele:
         image = ele["image"]
     else:
@@ -101,7 +106,9 @@ def fetch_image(ele: dict[str, str | Image.Image], size_factor: int = IMAGE_FACT
     else:
         image_obj = Image.open(image)
     if image_obj is None:
-        raise ValueError(f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}")
+        raise ValueError(
+            f"Unrecognized image input, support local path, http url, base64 and PIL.Image, got {image}"
+        )
     image = image_obj.convert("RGB")
     ## resize
     if "resized_height" in ele and "resized_width" in ele:
@@ -149,20 +156,26 @@ def smart_nframes(
     Returns:
         int: the number of frames for video used for model inputs.
     """
-    assert not ("fps" in ele and "nframes" in ele), "Only accept either `fps` or `nframes`"
+    assert not (
+        "fps" in ele and "nframes" in ele
+    ), "Only accept either `fps` or `nframes`"
     if "nframes" in ele:
         nframes = round_by_factor(ele["nframes"], FRAME_FACTOR)
     else:
         fps = ele.get("fps", FPS)
         min_frames = ceil_by_factor(ele.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
-        max_frames = floor_by_factor(ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), FRAME_FACTOR)
+        max_frames = floor_by_factor(
+            ele.get("max_frames", min(FPS_MAX_FRAMES, total_frames)), FRAME_FACTOR
+        )
         nframes = total_frames / video_fps * fps
         nframes = min(max(nframes, min_frames), max_frames)
         nframes = round_by_factor(nframes, FRAME_FACTOR)
     if nframes > total_frames:
         nframes = total_frames
     if not (FRAME_FACTOR <= nframes and nframes <= total_frames):
-        raise ValueError(f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}.")
+        raise ValueError(
+            f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}."
+        )
     return nframes
 
 
@@ -183,7 +196,9 @@ def _read_video_torchvision(
     video_path = ele["video"]
     if version.parse(torchvision.__version__) < version.parse("0.19.0"):
         if "http://" in video_path or "https://" in video_path:
-            warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
+            warnings.warn(
+                "torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0."
+            )
         if "file://" in video_path:
             video_path = video_path[7:]
     st = time.time()
@@ -197,23 +212,27 @@ def _read_video_torchvision(
 
     total_frames, video_fps = video.size(0), info["video_fps"]
     # logger.info(f"torchvision:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
-    if ele['sample_type'] == 'uniform':
+    if ele["sample_type"] == "uniform":
         nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
         idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
-    elif ele['sample_type'] == 'multi_pts':
+    elif ele["sample_type"] == "multi_pts":
         frames_each_pts = 6
         num_pts = 4
         fps = 8
         nframes = int(total_frames * fps // video_fps)
-        frames_idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+        frames_idx = (
+            torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+        )
 
         start_pt = int(frames_each_pts // 2)
         end_pt = int(nframes - frames_each_pts // 2 - 1)
         pts = torch.linspace(start_pt, end_pt, num_pts).round().long().tolist()
         idx = []
         for pt in pts:
-            idx.extend(frames_idx[pt - frames_each_pts // 2 : pt + frames_each_pts // 2])
-   
+            idx.extend(
+                frames_idx[pt - frames_each_pts // 2 : pt + frames_each_pts // 2]
+            )
+
     video = video[idx]
     return video
 
@@ -239,32 +258,39 @@ def _read_video_decord(
         torch.Tensor: the video tensor with shape (T, C, H, W).
     """
     import decord
+
     video_path = ele["video"]
     st = time.time()
     vr = decord.VideoReader(video_path)
     # TODO: support start_pts and end_pts
-    if 'video_start' in ele or 'video_end' in ele:
-        raise NotImplementedError("not support start_pts and end_pts in decord for now.")
+    if "video_start" in ele or "video_end" in ele:
+        raise NotImplementedError(
+            "not support start_pts and end_pts in decord for now."
+        )
     total_frames, video_fps = len(vr), vr.get_avg_fps()
     # logger.info(f"decord:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
-    if ele['sample_type'] == 'uniform':
+    if ele["sample_type"] == "uniform":
         nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
         # nframes = max(nframes, 8)
         # import pdb; pdb.set_trace()
         idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
-    elif ele['sample_type'] == 'multi_pts':
+    elif ele["sample_type"] == "multi_pts":
         frames_each_pts = 6
         num_pts = 4
         fps = 8
         nframes = int(total_frames * fps // video_fps)
-        frames_idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+        frames_idx = (
+            torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+        )
 
         start_pt = int(frames_each_pts // 2)
         end_pt = int(nframes - frames_each_pts // 2 - 1)
         pts = torch.linspace(start_pt, end_pt, num_pts).round().long().tolist()
         idx = []
         for pt in pts:
-            idx.extend(frames_idx[pt - frames_each_pts // 2 : pt + frames_each_pts // 2])
+            idx.extend(
+                frames_idx[pt - frames_each_pts // 2 : pt + frames_each_pts // 2]
+            )
     video = vr.get_batch(idx).asnumpy()
     video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
     return video
@@ -275,7 +301,7 @@ VIDEO_READER_BACKENDS = {
     "torchvision": _read_video_torchvision,
 }
 
-FORCE_QWENVL_VIDEO_READER = os.getenv("FORCE_QWENVL_VIDEO_READER", None)
+FORCE_QWENVL_VIDEO_READER = os.getenv("FORCE_QWENVL_VIDEO_READER", "decord")
 
 
 @lru_cache(maxsize=1)
@@ -288,7 +314,9 @@ def get_video_reader_backend() -> str:
     return video_reader_backend
 
 
-def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR) -> torch.Tensor | list[Image.Image]:
+def fetch_video(
+    ele: dict, image_factor: int = IMAGE_FACTOR
+) -> torch.Tensor | list[Image.Image]:
     if isinstance(ele["video"], str):
         video_reader_backend = get_video_reader_backend()
         video = VIDEO_READER_BACKENDS[video_reader_backend](ele)
@@ -297,7 +325,10 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR) -> torch.Tensor | l
 
         min_pixels = ele.get("min_pixels", VIDEO_MIN_PIXELS)
         total_pixels = ele.get("total_pixels", VIDEO_TOTAL_PIXELS)
-        max_pixels = max(min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR), int(min_pixels * 1.05))
+        max_pixels = max(
+            min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
+            int(min_pixels * 1.05),
+        )
         max_pixels = ele.get("max_pixels", max_pixels)
         if "resized_height" in ele and "resized_width" in ele:
             resized_height, resized_width = smart_resize(
@@ -326,7 +357,9 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR) -> torch.Tensor | l
         process_info.pop("type", None)
         process_info.pop("video", None)
         images = [
-            fetch_image({"image": video_element, **process_info}, size_factor=image_factor)
+            fetch_image(
+                {"image": video_element, **process_info}, size_factor=image_factor
+            )
             for video_element in ele["video"]
         ]
         nframes = ceil_by_factor(len(images), FRAME_FACTOR)

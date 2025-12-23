@@ -94,7 +94,16 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # pdb.set_trace()
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            embed_tokens = getattr(self.model, "embed_tokens", None)
+            if embed_tokens is None and hasattr(self.model, "model"):
+                embed_tokens = getattr(self.model.model, "embed_tokens", None)
+            if embed_tokens is None and hasattr(self.model, "get_input_embeddings"):
+                embed_tokens = self.model.get_input_embeddings()
+            if embed_tokens is None:
+                raise AttributeError(
+                    "Qwen2VLModel is missing `embed_tokens`. Please check the installed transformers version."
+                )
+            inputs_embeds = embed_tokens(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.get_dtype())
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)

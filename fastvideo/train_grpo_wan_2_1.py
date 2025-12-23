@@ -1,6 +1,6 @@
 # Copyright (c) [2025] [FastVideo Team]
 # Copyright (c) [2025] [ByteDance Ltd. and/or its affiliates.]
-# SPDX-License-Identifier: [Apache License 2.0] 
+# SPDX-License-Identifier: [Apache License 2.0]
 #
 # This file has been modified by [ByteDance Ltd. and/or its affiliates.] in 2025.
 #
@@ -8,62 +8,70 @@
 # available at [https://github.com/hao-ai-lab/FastVideo/blob/main/LICENSE].
 #
 # This modified file is released under the same license.
+import os
 
+os.environ["HF_HOME"] = "/capstor/scratch/cscs/mhasan/.cache"
 import argparse
 import math
 import os
-from pathlib import Path
-from fastvideo.utils.parallel_states import (
-    initialize_sequence_parallel_state,
-    destroy_sequence_parallel_group,
-    get_sequence_parallel_state,
-    nccl_info,
-)
-from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper
-from fastvideo.utils.validation import log_validation
 import time
-from torch.utils.data import DataLoader
-import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict, StateDictOptions
+from pathlib import Path
 
-from torch.utils.data.distributed import DistributedSampler
-from fastvideo.utils.dataset_utils import LengthGroupedSampler
+import cv2
+import torch
+import torch.distributed as dist
 import wandb
 from accelerate.utils import set_seed
-from tqdm.auto import tqdm
-from fastvideo.utils.fsdp_util import get_dit_fsdp_kwargs, apply_fsdp_checkpointing
-from fastvideo.utils.load import load_transformer
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
-from fastvideo.dataset.latent_wan_2_1_rl_datasets import LatentDataset, latent_collate_function
-import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from fastvideo.utils.checkpoint import (
-    save_checkpoint,
-    save_lora_checkpoint,
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
 )
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
+
+from fastvideo.dataset.latent_wan_2_1_rl_datasets import (
+    LatentDataset,
+    latent_collate_function,
+)
+from fastvideo.utils.checkpoint import save_checkpoint, save_lora_checkpoint
+from fastvideo.utils.communications_flux import sp_parallel_dataloader_wrapper
+from fastvideo.utils.dataset_utils import LengthGroupedSampler
+from fastvideo.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
+from fastvideo.utils.load import load_transformer
 from fastvideo.utils.logging_ import main_print
-import cv2
-from diffusers.image_processor import VaeImageProcessor
+from fastvideo.utils.parallel_states import (
+    destroy_sequence_parallel_group,
+    get_sequence_parallel_state,
+    initialize_sequence_parallel_state,
+    nccl_info,
+)
+from fastvideo.utils.validation import log_validation
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
+import json
 import time
 from collections import deque
-import numpy as np
-from einops import rearrange
-import torch.distributed as dist
-from torch.nn import functional as F
+from contextlib import contextmanager
 from typing import List
-from PIL import Image
+
+import numpy as np
+import torch.distributed as dist
 from diffusers import AutoencoderKLWan, WanTransformer3DModel
 from diffusers.models.transformers.transformer_wan import WanTransformerBlock
-from contextlib import contextmanager
-from safetensors.torch import save_file
-from diffusers.video_processor import VideoProcessor
 from diffusers.utils import export_to_video
-import json
+from diffusers.video_processor import VideoProcessor
+from einops import rearrange
+from PIL import Image
+from safetensors.torch import save_file
+from torch.nn import functional as F
+
 
 def video_first_frame_to_pil(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -86,10 +94,9 @@ def video_first_frame_to_pil(video_path):
     return pil_image
 
 
-
 def sd3_time_shift(shift, t):
     return (shift * t) / (1 + (shift - 1) * t)
-    
+
 
 def flux_step(
     model_output: torch.Tensor,
@@ -111,27 +118,35 @@ def flux_step(
     std_dev_t = eta * math.sqrt(delta_t)
 
     if sde_solver:
-        score_estimate = -(latents-pred_original_sample*(1 - sigma))/sigma**2
+        score_estimate = -(latents - pred_original_sample * (1 - sigma)) / sigma**2
         log_term = -0.5 * eta**2 * score_estimate
         prev_sample_mean = prev_sample_mean + log_term * dsigma
 
     if grpo and prev_sample is None:
-        prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t 
-        
+        prev_sample = prev_sample_mean + torch.randn_like(prev_sample_mean) * std_dev_t
 
     if grpo:
         # log prob of prev_sample given prev_sample_mean and std_dev_t
-        log_prob = ((
-            -((prev_sample.detach().to(torch.float32) - prev_sample_mean.to(torch.float32)) ** 2) / (2 * (std_dev_t**2))
+        log_prob = (
+            (
+                -(
+                    (
+                        prev_sample.detach().to(torch.float32)
+                        - prev_sample_mean.to(torch.float32)
+                    )
+                    ** 2
+                )
+                / (2 * (std_dev_t**2))
+            )
+            - math.log(std_dev_t)
+            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
         )
-        - math.log(std_dev_t)- torch.log(torch.sqrt(2 * torch.as_tensor(math.pi))))
 
         # mean along all but batch dimension
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
         return prev_sample, pred_original_sample, log_prob
     else:
-        return prev_sample_mean,pred_original_sample
-
+        return prev_sample_mean, pred_original_sample
 
 
 def assert_eq(x, y, msg=None):
@@ -143,7 +158,9 @@ def prepare_latent_image_ids(batch_size, height, width, device, dtype):
     latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
     latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
 
-    latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
+    latent_image_id_height, latent_image_id_width, latent_image_id_channels = (
+        latent_image_ids.shape
+    )
 
     latent_image_ids = latent_image_ids.reshape(
         latent_image_id_height * latent_image_id_width, latent_image_id_channels
@@ -151,12 +168,18 @@ def prepare_latent_image_ids(batch_size, height, width, device, dtype):
 
     return latent_image_ids.to(device=device, dtype=dtype)
 
+
 def pack_latents(latents, batch_size, num_channels_latents, height, width):
-    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+    latents = latents.view(
+        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+    )
     latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+    latents = latents.reshape(
+        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
+    )
 
     return latents
+
 
 def unpack_latents(latents, height, width, vae_scale_factor):
     batch_size, num_patches, channels = latents.shape
@@ -173,16 +196,17 @@ def unpack_latents(latents, height, width, vae_scale_factor):
 
     return latents
 
+
 def run_sample_step(
-        args,
-        z,
-        progress_bar,
-        sigma_schedule,
-        transformer,
-        encoder_hidden_states, 
-        negative_prompt_embeds, 
-        grpo_sample,
-    ):
+    args,
+    z,
+    progress_bar,
+    sigma_schedule,
+    transformer,
+    encoder_hidden_states,
+    negative_prompt_embeds,
+    grpo_sample,
+):
     if grpo_sample:
         all_latents = [z]
         all_log_probs = []
@@ -190,83 +214,115 @@ def run_sample_step(
             B = encoder_hidden_states.shape[0]
             sigma = sigma_schedule[i]
             timestep_value = int(sigma * 1000)
-            timesteps = torch.full([encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
+            timesteps = torch.full(
+                [encoder_hidden_states.shape[0]],
+                timestep_value,
+                device=z.device,
+                dtype=torch.long,
+            )
             transformer.eval()
-            if args.cfg_infer>1:
+            if args.cfg_infer > 1:
                 with torch.autocast("cuda", torch.bfloat16):
-                    pred= transformer(
-                        hidden_states=torch.cat([z,z],dim=0),
-                        timestep=torch.cat([timesteps,timesteps],dim=0),
-                        encoder_hidden_states=torch.cat([encoder_hidden_states,negative_prompt_embeds],dim=0),
+                    pred = transformer(
+                        hidden_states=torch.cat([z, z], dim=0),
+                        timestep=torch.cat([timesteps, timesteps], dim=0),
+                        encoder_hidden_states=torch.cat(
+                            [encoder_hidden_states, negative_prompt_embeds], dim=0
+                        ),
                         attention_kwargs=None,
                         return_dict=False,
                     )[0]
                     model_pred, uncond_pred = pred.chunk(2)
-                    pred  =  uncond_pred.to(torch.float32) + args.cfg_infer * (model_pred.to(torch.float32) - uncond_pred.to(torch.float32))
+                    pred = uncond_pred.to(torch.float32) + args.cfg_infer * (
+                        model_pred.to(torch.float32) - uncond_pred.to(torch.float32)
+                    )
             else:
-                 with torch.autocast("cuda", torch.bfloat16):
-                    pred= transformer(
+                with torch.autocast("cuda", torch.bfloat16):
+                    pred = transformer(
                         hidden_states=z,
                         timestep=timesteps,
                         encoder_hidden_states=encoder_hidden_states,
                         attention_kwargs=None,
                         return_dict=False,
                     )[0]
-            z, pred_original, log_prob = flux_step(pred, z.to(torch.float32), args.eta, sigmas=sigma_schedule, index=i, prev_sample=None, grpo=True, sde_solver=True)
+            z, pred_original, log_prob = flux_step(
+                pred,
+                z.to(torch.float32),
+                args.eta,
+                sigmas=sigma_schedule,
+                index=i,
+                prev_sample=None,
+                grpo=True,
+                sde_solver=True,
+            )
             z.to(torch.bfloat16)
             all_latents.append(z)
             all_log_probs.append(log_prob)
         latents = pred_original
-        all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
+        all_latents = torch.stack(
+            all_latents, dim=1
+        )  # (batch_size, num_steps + 1, 4, 64, 64)
         all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)
         return z, latents, all_latents, all_log_probs
 
-        
+
 def grpo_one_step(
-            args,
-            latents,
-            pre_latents,
-            encoder_hidden_states, 
-            negative_prompt_embeds, 
-            transformer,
-            timesteps,
-            i,
-            sigma_schedule,
+    args,
+    latents,
+    pre_latents,
+    encoder_hidden_states,
+    negative_prompt_embeds,
+    transformer,
+    timesteps,
+    i,
+    sigma_schedule,
 ):
     B = encoder_hidden_states.shape[0]
     transformer.train()
-    if args.cfg_infer>1:
+    if args.cfg_infer > 1:
         with torch.autocast("cuda", torch.bfloat16):
-            pred= transformer(
-                hidden_states=torch.cat([latents,latents],dim=0),
-                timestep=torch.cat([timesteps,timesteps],dim=0),
-                encoder_hidden_states=torch.cat([encoder_hidden_states,negative_prompt_embeds],dim=0),
+            pred = transformer(
+                hidden_states=torch.cat([latents, latents], dim=0),
+                timestep=torch.cat([timesteps, timesteps], dim=0),
+                encoder_hidden_states=torch.cat(
+                    [encoder_hidden_states, negative_prompt_embeds], dim=0
+                ),
                 attention_kwargs=None,
                 return_dict=False,
             )[0]
             model_pred, uncond_pred = pred.chunk(2)
-            pred  =  uncond_pred.to(torch.float32) + args.cfg_infer * (model_pred.to(torch.float32) - uncond_pred.to(torch.float32))
+            pred = uncond_pred.to(torch.float32) + args.cfg_infer * (
+                model_pred.to(torch.float32) - uncond_pred.to(torch.float32)
+            )
     else:
         with torch.autocast("cuda", torch.bfloat16):
-            pred= transformer(
+            pred = transformer(
                 hidden_states=latents,
                 timestep=timesteps,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_kwargs=None,
                 return_dict=False,
             )[0]
-    z, pred_original, log_prob = flux_step(pred, latents.to(torch.float32), args.eta, sigma_schedule, i, prev_sample=pre_latents.to(torch.float32), grpo=True, sde_solver=True)
+    z, pred_original, log_prob = flux_step(
+        pred,
+        latents.to(torch.float32),
+        args.eta,
+        sigma_schedule,
+        i,
+        prev_sample=pre_latents.to(torch.float32),
+        grpo=True,
+        sde_solver=True,
+    )
     return log_prob
-
 
 
 def sample_reference_model(
     args,
-    device, 
+    device,
     transformer,
     vae,
-    encoder_hidden_states, 
-    negative_prompt_embeds, 
+    encoder_hidden_states,
+    negative_prompt_embeds,
     reward_model,
     tokenizer,
     caption,
@@ -275,7 +331,7 @@ def sample_reference_model(
     w, h, t = args.w, args.h, args.t
     sample_steps = args.sampling_steps
     sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1)
-    
+
     sigma_schedule = sd3_time_shift(args.shift, sigma_schedule)
 
     assert_eq(
@@ -291,18 +347,18 @@ def sample_reference_model(
     latent_t = ((t - 1) // TEMPORAL_DOWNSAMPLE) + 1
     latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
 
-    batch_size = 1  
+    batch_size = 1
     batch_indices = torch.chunk(torch.arange(B), B // batch_size)
 
     all_latents = []
     all_log_probs = []
-    all_rewards = []  
+    all_rewards = []
     if args.init_same_noise:
         input_latents = torch.randn(
-                (1, IN_CHANNELS, latent_t, latent_h, latent_w),  #（c,t,h,w)
-                device=device,
-                dtype=torch.bfloat16,
-            )
+            (1, IN_CHANNELS, latent_t, latent_h, latent_w),  # （c,t,h,w)
+            device=device,
+            dtype=torch.bfloat16,
+        )
 
     for index, batch_idx in enumerate(batch_indices):
         batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
@@ -310,11 +366,11 @@ def sample_reference_model(
         batch_caption = [caption[i] for i in batch_idx]
         if not args.init_same_noise:
             input_latents = torch.randn(
-                    (1, IN_CHANNELS, latent_t, latent_h, latent_w),  #（c,t,h,w)
-                    device=device,
-                    dtype=torch.bfloat16,
-                )
-        grpo_sample=True
+                (1, IN_CHANNELS, latent_t, latent_h, latent_w),  # （c,t,h,w)
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        grpo_sample = True
         progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress")
         with torch.no_grad():
             z, latents, batch_latents, batch_log_probs = run_sample_step(
@@ -324,17 +380,16 @@ def sample_reference_model(
                 sigma_schedule,
                 transformer,
                 batch_encoder_hidden_states,
-                batch_negative_prompt_embeds, 
+                batch_negative_prompt_embeds,
                 grpo_sample,
             )
         all_latents.append(batch_latents)
         all_log_probs.append(batch_log_probs)
         vae.enable_tiling()
-        
+
         video_processor = VideoProcessor(vae_scale_factor=8)
         rank = int(os.environ["RANK"])
 
-        
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 latents_mean = (
@@ -342,24 +397,37 @@ def sample_reference_model(
                     .view(1, vae.config.z_dim, 1, 1, 1)
                     .to(latents.device, latents.dtype)
                 )
-                latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(
-                    latents.device, latents.dtype
-                )
+                latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(
+                    1, vae.config.z_dim, 1, 1, 1
+                ).to(latents.device, latents.dtype)
                 latents = latents / latents_std + latents_mean
                 video = vae.decode(latents, return_dict=False)[0]
                 decoded_video = video_processor.postprocess_video(video)
-        export_to_video(decoded_video[0], f"./videos/wan_2_1_{rank}_{index}.mp4", fps=24)
+        export_to_video(
+            decoded_video[0], f"./videos/wan_2_1_{rank}_{index}.mp4", fps=24
+        )
 
         if args.use_hpsv2:
             with torch.no_grad():
-                image_path = video_first_frame_to_pil(f"./videos/wan_2_1_{rank}_{index}.mp4")
-                image = preprocess_val(image_path).unsqueeze(0).to(device=device, non_blocking=True)
+                image_path = video_first_frame_to_pil(
+                    f"./videos/wan_2_1_{rank}_{index}.mp4"
+                )
+                image = (
+                    preprocess_val(image_path)
+                    .unsqueeze(0)
+                    .to(device=device, non_blocking=True)
+                )
                 # Process the prompt
-                text = tokenizer([batch_caption[0]]).to(device=device, non_blocking=True)
+                text = tokenizer([batch_caption[0]]).to(
+                    device=device, non_blocking=True
+                )
                 # Calculate the HPS
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast("cuda"):
                     outputs = reward_model(image, text)
-                    image_features, text_features = outputs["image_features"], outputs["text_features"]
+                    image_features, text_features = (
+                        outputs["image_features"],
+                        outputs["text_features"],
+                    )
                     logits_per_image = image_features @ text_features.T
                     hps_score = torch.diagonal(logits_per_image)
                 all_rewards.append(hps_score)
@@ -367,7 +435,7 @@ def sample_reference_model(
     all_latents = torch.cat(all_latents, dim=0)
     all_log_probs = torch.cat(all_log_probs, dim=0)
     all_rewards = torch.cat(all_rewards, dim=0)
-    
+
     return all_rewards, all_latents, all_log_probs, sigma_schedule
 
 
@@ -379,6 +447,7 @@ def gather_tensor(tensor):
     dist.all_gather(gathered_tensors, tensor)
     return torch.cat(gathered_tensors, dim=0)
 
+
 def train_one_step(
     args,
     device,
@@ -388,8 +457,8 @@ def train_one_step(
     tokenizer,
     optimizer,
     lr_scheduler,
-    encoder_hidden_states, 
-    negative_prompt_embeds, 
+    encoder_hidden_states,
+    negative_prompt_embeds,
     caption,
     noise_scheduler,
     max_grad_norm,
@@ -397,8 +466,9 @@ def train_one_step(
 ):
     total_loss = 0.0
     optimizer.zero_grad()
-    #device = latents.device
+    # device = latents.device
     if args.use_group:
+
         def repeat_tensor(tensor):
             if tensor is None:
                 return None
@@ -406,7 +476,6 @@ def train_one_step(
 
         encoder_hidden_states = repeat_tensor(encoder_hidden_states)
         negative_prompt_embeds = repeat_tensor(negative_prompt_embeds)
-
 
         if isinstance(caption, str):
             caption = [caption] * args.num_generations
@@ -416,47 +485,51 @@ def train_one_step(
             raise ValueError(f"Unsupported caption type: {type(caption)}")
 
     reward, all_latents, all_log_probs, sigma_schedule = sample_reference_model(
-            args,
-            device, 
-            transformer,
-            vae,
-            encoder_hidden_states, 
-            negative_prompt_embeds, 
-            reward_model,
-            tokenizer,
-            caption,
-            preprocess_val,
-        )
+        args,
+        device,
+        transformer,
+        vae,
+        encoder_hidden_states,
+        negative_prompt_embeds,
+        reward_model,
+        tokenizer,
+        caption,
+        preprocess_val,
+    )
     batch_size = all_latents.shape[0]
-    timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][:args.sampling_steps]
+    timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][
+        : args.sampling_steps
+    ]
     timestep_values = [timestep_value[:] for _ in range(batch_size)]
     device = all_latents.device
-    timesteps =  torch.tensor(timestep_values, device=all_latents.device, dtype=torch.long)
+    timesteps = torch.tensor(
+        timestep_values, device=all_latents.device, dtype=torch.long
+    )
 
     samples = {
         "timesteps": timesteps.detach().clone()[:, :-1],
-        "latents": all_latents[
+        "latents": all_latents[:, :-1][
             :, :-1
-        ][:, :-1],  # each entry is the latent before timestep t
-        "next_latents": all_latents[
-            :, 1:
-        ][:, :-1],  # each entry is the latent after timestep t
+        ],  # each entry is the latent before timestep t
+        "next_latents": all_latents[:, 1:][
+            :, :-1
+        ],  # each entry is the latent after timestep t
         "log_probs": all_log_probs[:, :-1],
         "rewards": reward.to(torch.float32),
         "encoder_hidden_states": encoder_hidden_states,
         "negative_prompt_embeds": negative_prompt_embeds,
     }
     gathered_reward = gather_tensor(samples["rewards"])
-    if dist.get_rank()==0:
+    if dist.get_rank() == 0:
         print("gathered_reward", gathered_reward)
-        with open('./reward.txt', 'a') as f: 
+        with open("./reward.txt", "a") as f:
             f.write(f"{gathered_reward.mean().item()}\n")
 
-    #计算advantage
+    # 计算advantage
     if args.use_group:
         n = len(samples["rewards"]) // (args.num_generations)
         advantages = torch.zeros_like(samples["rewards"])
-        
+
         for i in range(n):
             start_idx = i * args.num_generations
             end_idx = (i + 1) * args.num_generations
@@ -464,45 +537,40 @@ def train_one_step(
             group_mean = group_rewards.mean()
             group_std = group_rewards.std() + 1e-8
             advantages[start_idx:end_idx] = (group_rewards - group_mean) / group_std
-        
+
         samples["advantages"] = advantages
     else:
-        advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
+        advantages = (samples["rewards"] - gathered_reward.mean()) / (
+            gathered_reward.std() + 1e-8
+        )
         samples["advantages"] = advantages
 
-    
     perms = torch.stack(
-        [
-            torch.randperm(len(samples["timesteps"][0]))
-            for _ in range(batch_size)
-        ]
-    ).to(device) 
+        [torch.randperm(len(samples["timesteps"][0])) for _ in range(batch_size)]
+    ).to(device)
     for key in ["timesteps", "latents", "next_latents", "log_probs"]:
         samples[key] = samples[key][
-            torch.arange(batch_size).to(device) [:, None],
+            torch.arange(batch_size).to(device)[:, None],
             perms,
         ]
-    samples_batched = {
-        k: v.unsqueeze(1)
-        for k, v in samples.items()
-    }
+    samples_batched = {k: v.unsqueeze(1) for k, v in samples.items()}
     # dict of lists -> list of dicts for easier iteration
     samples_batched_list = [
         dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
     ]
-    train_timesteps = int(len(samples["timesteps"][0])*args.timestep_fraction)
-    for i,sample in list(enumerate(samples_batched_list)):
+    train_timesteps = int(len(samples["timesteps"][0]) * args.timestep_fraction)
+    for i, sample in list(enumerate(samples_batched_list)):
         for _ in range(train_timesteps):
             clip_range = args.clip_range
             adv_clip_max = args.adv_clip_max
             new_log_probs = grpo_one_step(
                 args,
-                sample["latents"][:,_],
-                sample["next_latents"][:,_],
+                sample["latents"][:, _],
+                sample["next_latents"][:, _],
                 sample["encoder_hidden_states"],
                 sample["negative_prompt_embeds"],
                 transformer,
-                sample["timesteps"][:,_],
+                sample["timesteps"][:, _],
                 perms[i][_],
                 sigma_schedule,
             )
@@ -513,7 +581,7 @@ def train_one_step(
                 adv_clip_max,
             )
 
-            ratio = torch.exp(new_log_probs - sample["log_probs"][:,_])
+            ratio = torch.exp(new_log_probs - sample["log_probs"][:, _])
 
             unclipped_loss = -advantages * ratio
             clipped_loss = -advantages * torch.clamp(
@@ -521,18 +589,22 @@ def train_one_step(
                 1.0 - clip_range,
                 1.0 + clip_range,
             )
-            loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) / (args.gradient_accumulation_steps * train_timesteps)
+            loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss)) / (
+                args.gradient_accumulation_steps * train_timesteps
+            )
 
             loss.backward()
             avg_loss = loss.detach().clone()
             dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
             total_loss += avg_loss.item()
-        if (i+1)%args.gradient_accumulation_steps==0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=max_grad_norm)
+        if (i + 1) % args.gradient_accumulation_steps == 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                transformer.parameters(), max_norm=max_grad_norm
+            )
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-        if dist.get_rank()%8==0:
+        if dist.get_rank() % 8 == 0:
             print("reward", sample["rewards"].item())
             print("ratio", ratio)
             print("advantage", sample["advantages"].item())
@@ -567,16 +639,18 @@ def main(args):
     preprocess_val = None
     processor = None
     if args.use_hpsv2:
-        from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
         from typing import Union
+
         import huggingface_hub
-        from hpsv2.utils import root_path, hps_version_map
+        from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
+        from hpsv2.utils import hps_version_map, root_path
+
         def initialize_model():
             model_dict = {}
             model, preprocess_train, preprocess_val = create_model_and_transforms(
-                'ViT-H-14',
-                './hps_ckpt/open_clip_pytorch_model.bin',
-                precision='amp',
+                "ViT-H-14",
+                "data/hps_ckpt/open_clip_pytorch_model.bin",
+                precision="amp",
                 device=device,
                 jit=False,
                 force_quick_gelu=False,
@@ -590,43 +664,42 @@ def main(args):
                 aug_cfg={},
                 output_dict=True,
                 with_score_predictor=False,
-                with_region_predictor=False
+                with_region_predictor=False,
             )
-            model_dict['model'] = model
-            model_dict['preprocess_val'] = preprocess_val
+            model_dict["model"] = model
+            model_dict["preprocess_val"] = preprocess_val
             return model_dict
-        model_dict = initialize_model()
-        model = model_dict['model']
-        preprocess_val = model_dict['preprocess_val']
-        #cp = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map["v2.1"])
-        cp = "./hps_ckpt/HPS_v2.1_compressed.pt"
 
-        checkpoint = torch.load(cp, map_location=f'cuda:{device}')
-        model.load_state_dict(checkpoint['state_dict'])
-        processor = get_tokenizer('ViT-H-14')
+        model_dict = initialize_model()
+        model = model_dict["model"]
+        preprocess_val = model_dict["preprocess_val"]
+        # cp = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map["v2.1"])
+        cp = "data/hps_ckpt/HPS_v2.1_compressed.pt"
+
+        checkpoint = torch.load(cp, map_location=f"cuda:{device}")
+        model.load_state_dict(checkpoint["state_dict"])
+        processor = get_tokenizer("ViT-H-14")
         reward_model = model.to(device)
         reward_model.eval()
 
-
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
     # keep the master weight to float32
-    
-    transformer = WanTransformer3DModel.from_pretrained(    
-            args.pretrained_model_name_or_path,
-            subfolder="transformer",
-            torch_dtype = torch.bfloat16
+
+    transformer = WanTransformer3DModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16,
     ).to(device)
 
     if args.gradient_checkpointing:
         apply_fsdp_checkpointing(
             transformer, (WanTransformerBlock), args.selective_checkpointing
         )
-    
 
     vae = AutoencoderKLWan.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
-        torch_dtype = torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     ).to(device)
 
     main_print(
@@ -666,9 +739,12 @@ def main(args):
 
     train_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
     sampler = DistributedSampler(
-            train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
-        )
-    
+        train_dataset,
+        rank=rank,
+        num_replicas=world_size,
+        shuffle=True,
+        seed=args.sampler_seed,
+    )
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -680,7 +756,7 @@ def main(args):
         drop_last=True,
     )
 
-    #vae.enable_tiling()
+    # vae.enable_tiling()
 
     if rank <= 0:
         project = "wan_2_1"
@@ -722,25 +798,29 @@ def main(args):
         disable=local_rank > 0,
     )
 
-
     step_times = deque(maxlen=100)
 
     # The number of epochs 1 is a random value; you can also set the number of epochs to be two.
     for epoch in range(1):
         if isinstance(sampler, DistributedSampler):
-            sampler.set_epoch(epoch) # Crucial for distributed shuffling per epoch       
-        for step, (prompt_embeds, negative_prompt_embeds, caption) in enumerate(train_dataloader):
+            sampler.set_epoch(epoch)  # Crucial for distributed shuffling per epoch
+        for step, (prompt_embeds, negative_prompt_embeds, caption) in enumerate(
+            train_dataloader
+        ):
             prompt_embeds = prompt_embeds.to(device)
             negative_prompt_embeds = negative_prompt_embeds.to(device)
             start_time = time.time()
-            if (step-1) % args.checkpointing_steps == 0 and step!=1:
+            if (step - 1) % args.checkpointing_steps == 0 and step != 1:
                 cpu_state = transformer.state_dict()
                 if rank <= 0:
-                    save_dir = os.path.join(args.output_dir, f"checkpoint-{step}-{epoch}")
+                    save_dir = os.path.join(
+                        args.output_dir, f"checkpoint-{step}-{epoch}"
+                    )
                     os.makedirs(save_dir, exist_ok=True)
                     # save using safetensors
-                    weight_path = os.path.join(save_dir,
-                                            "diffusion_pytorch_model.safetensors")
+                    weight_path = os.path.join(
+                        save_dir, "diffusion_pytorch_model.safetensors"
+                    )
                     save_file(cpu_state, weight_path)
                     config_dict = dict(transformer.config)
                     if "dtype" in config_dict:
@@ -751,30 +831,29 @@ def main(args):
                         json.dump(config_dict, f, indent=4)
                 main_print(f"--> checkpoint saved at step {step}")
                 dist.barrier()
-            if step>args.max_train_steps:
+            if step > args.max_train_steps:
                 break
             loss, grad_norm = train_one_step(
                 args,
-                device, 
+                device,
                 transformer,
                 vae,
                 reward_model,
                 processor,
                 optimizer,
                 lr_scheduler,
-                prompt_embeds, 
-                negative_prompt_embeds, 
+                prompt_embeds,
+                negative_prompt_embeds,
                 caption,
                 noise_scheduler,
                 args.max_grad_norm,
                 preprocess_val,
             )
 
-    
             step_time = time.time() - start_time
             step_times.append(step_time)
             avg_step_time = sum(step_times) / len(step_times)
-    
+
             progress_bar.set_postfix(
                 {
                     "loss": f"{loss:.4f}",
@@ -794,8 +873,6 @@ def main(args):
                     },
                     step=step,
                 )
-
-
 
     if get_sequence_parallel_state():
         destroy_sequence_parallel_group()
@@ -979,47 +1056,47 @@ if __name__ == "__main__":
         help="Weight type to use - fp32 or bf16.",
     )
 
-    #GRPO training
+    # GRPO training
     parser.add_argument(
         "--h",
         type=int,
-        default=None,   
+        default=None,
         help="video height",
     )
     parser.add_argument(
         "--w",
         type=int,
-        default=None,   
+        default=None,
         help="video width",
     )
     parser.add_argument(
         "--t",
         type=int,
-        default=None,   
+        default=None,
         help="video length",
     )
     parser.add_argument(
         "--sampling_steps",
         type=int,
-        default=None,   
+        default=None,
         help="sampling steps",
     )
     parser.add_argument(
         "--eta",
         type=float,
-        default=None,   
+        default=None,
         help="noise eta",
     )
     parser.add_argument(
         "--sampler_seed",
         type=int,
-        default=None,   
+        default=None,
         help="seed of sampler",
     )
     parser.add_argument(
         "--loss_coef",
         type=float,
-        default=1.0,   
+        default=1.0,
         help="the global loss should be divided by",
     )
     parser.add_argument(
@@ -1031,7 +1108,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_generations",
         type=int,
-        default=16,   
+        default=16,
         help="num_generations per prompt",
     )
     parser.add_argument(
@@ -1054,38 +1131,34 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--shift",
-        type = float,
+        type=float,
         default=1.0,
         help="shift for timestep scheduler",
     )
     parser.add_argument(
         "--timestep_fraction",
-        type = float,
+        type=float,
         default=1.0,
         help="timestep downsample ratio",
     )
     parser.add_argument(
         "--clip_range",
-        type = float,
+        type=float,
         default=1e-4,
         help="clip range for grpo",
     )
     parser.add_argument(
         "--adv_clip_max",
-        type = float,
+        type=float,
         default=5.0,
         help="clipping advantage",
     )
     parser.add_argument(
         "--cfg_infer",
-        type = float,
+        type=float,
         default=5.0,
         help="cfg for training",
     )
-    
-
-
-
 
     args = parser.parse_args()
     main(args)
